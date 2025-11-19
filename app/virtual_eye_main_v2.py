@@ -1,4 +1,4 @@
-# app/virtual_eye_phase5.py
+# app/virtual_eye_optimized.py
 import cv2
 import time
 from collections import defaultdict
@@ -10,7 +10,7 @@ import numpy as np
 import asyncio
 import io
 
-# --- NEW IMPORTS FOR PHASE 5 ---
+# --- IMPORTS ---
 import mediapipe as mp
 import face_recognition
 import google.generativeai as genai
@@ -19,22 +19,29 @@ from dotenv import load_dotenv
 from pydub import AudioSegment
 from pydub.playback import _play_with_simpleaudio as play
 
+# --- 1. PERFORMANCE OPTIMIZATIONS ---
+# We will process a smaller image to speed everything up significantly.
+PROCESSING_WIDTH = 480 
+# Process every Nth frame. A higher number means less lag but slower reactions.
+FRAME_PROCESSING_INTERVAL = 8 
+# Use the faster 'hog' model for face detection on CPU instead of 'cnn'.
+FACE_DETECTION_MODEL = "hog" 
+
 # --- CONFIGURATION & TUNING ---
 PRIORITY = {
     "person": 10, "car": 5, "bus": 5, "bicycle": 4, "motorbike": 4,
     "dog": 3, "cat": 3, "chair": 2, "table": 2, "phone": 1, "bottle": 1,
 }
-AI_NARRATION_INTERVAL = 10 # Seconds before re-evaluating a static scene
-MIN_NARRATION_GAP = 4 # Cooldown to prevent API spam
+AI_NARRATION_INTERVAL = 10
+MIN_NARRATION_GAP = 4
 TOP_K = 5 
-FRAME_PROCESSING_INTERVAL = 5 # Process every 5th frame to balance performance and responsiveness
 
 # --- AI & TTS SETUP ---
 load_dotenv()
 try:
     GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
     if not GOOGLE_API_KEY:
-        raise ValueError("GOOGLE_API_KEY not found in .env file or environment variables.")
+        raise ValueError("GOOGLE_API_KEY not found.")
     genai.configure(api_key=GOOGLE_API_KEY)
     llm_model = genai.GenerativeModel('gemini-1.5-flash-latest')
     print("Gemini AI model configured successfully.")
@@ -73,20 +80,16 @@ def load_known_faces(folder_path="known_faces"):
 def get_person_action(landmarks):
     """Analyzes pose landmarks to determine if a person is sitting or standing."""
     try:
-        # Get Y coordinates of hip and knee. In images, a higher Y value is lower on the screen.
         hip_y = landmarks.landmark[mp_pose.PoseLandmark.LEFT_HIP].y
         knee_y = landmarks.landmark[mp_pose.PoseLandmark.LEFT_KNEE].y
         shoulder_y = landmarks.landmark[mp_pose.PoseLandmark.LEFT_SHOULDER].y
-
-        # Simple heuristic: If the hip is visibly lower than the knee, the person is likely sitting.
-        # We add a small threshold based on body proportion to avoid misclassification.
-        threshold = (knee_y - shoulder_y) * 0.1 # 10% of the torso height
+        threshold = (knee_y - shoulder_y) * 0.1 
         if hip_y > knee_y + threshold:
             return "is sitting"
         else:
             return "is standing"
     except:
-        return None # Return nothing if landmarks aren't clear
+        return None
 
 def describe_scene_with_ai(scene_data):
     if not llm_model: return "AI model is not available."
@@ -97,8 +100,8 @@ def describe_scene_with_ai(scene_data):
     for obj in scene_data["objects"]:
         desc = obj['label']
         if obj.get('action'):
-            desc += f" {obj['action']}" # e.g., "Tejas is sitting"
-        desc += f" {obj['position']}" # e.g., "Tejas is sitting in front of you"
+            desc += f" {obj['action']}"
+        desc += f" {obj['position']}"
         object_descriptions.append(desc)
             
     prompt += ", and ".join(object_descriptions) + "."
@@ -153,7 +156,7 @@ def get_object_position(center_x, frame_width):
 def main():
     from ultralytics import YOLO 
     
-    print("Starting Virtual Eye (Phase 5: Pose Estimation)...")
+    print("Starting Virtual Eye (Optimized)...")
     known_face_encodings, known_face_names = load_known_faces()
     
     speech_thread = threading.Thread(target=speech_worker, daemon=True)
@@ -172,29 +175,33 @@ def main():
     last_ai_narration_time = 0
     last_spoken_narration = ""
     frame_skip_counter = 0
-    annotated_frame = None
-
+    last_annotated_frame = None # <-- ADDED: To hold the last frame with drawings
+    
     print("Application is running. Press ESC in the video window to quit.")
     while True:
         ret, frame = cap.read()
         if not ret: break
         
+        aspect_ratio = frame.shape[0] / frame.shape[1]
+        processing_height = int(PROCESSING_WIDTH * aspect_ratio)
+        resized_frame = cv2.resize(frame, (PROCESSING_WIDTH, processing_height))
+        
         is_processing_frame = frame_skip_counter % FRAME_PROCESSING_INTERVAL == 0
         frame_skip_counter += 1
 
         if is_processing_frame:
-            annotated_frame = frame.copy()
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            rgb_frame = cv2.cvtColor(resized_frame, cv2.COLOR_BGR2RGB)
             
-            # --- Primary YOLO Detection ---
-            yolo_results = model.predict(rgb_frame, conf=0.45, verbose=False, classes=[0, 24, 26, 28, 39, 41, 63, 64, 67])
-            annotated_frame = yolo_results[0].plot()
-
+            yolo_results = model.predict(rgb_frame, conf=0.45, verbose=False)
+            
+            # --- FIX: Generate the annotated frame from YOLO results ---
+            annotated_rgb = yolo_results[0].plot()
+            last_annotated_frame = cv2.cvtColor(annotated_rgb, cv2.COLOR_RGB2BGR)
+            
             # --- Scene Analysis ---
             current_confirmed_objects = []
             persons_detected = []
             
-            # 1. First, process all YOLO results to find people and other objects
             if hasattr(yolo_results[0].boxes, "cls"):
                 all_boxes = yolo_results[0].boxes
                 for i in range(len(all_boxes.cls)):
@@ -208,48 +215,35 @@ def main():
                     else:
                         current_confirmed_objects.append(obj_data)
 
-            # 2. If people were found, run advanced analysis on the LARGEST person
             if persons_detected:
-                # Sort people by the size of their bounding box to focus on the most prominent one
                 persons_detected.sort(key=lambda p: (p['box'][2] - p['box'][0]) * (p['box'][3] - p['box'][1]), reverse=True)
-                
-                # --- Run Pose & Face Recognition on the main person ---
                 main_person = persons_detected[0]
-                px1, py1, px2, py2 = main_person['box']
-                person_name = "a person" # Default name
+                
+                person_name = "a person"
                 person_action = None
 
-                # Face Recognition
-                face_locations = face_recognition.face_locations(rgb_frame, model="cnn")
+                face_locations = face_recognition.face_locations(rgb_frame, model=FACE_DETECTION_MODEL)
                 if face_locations:
                     face_encodings = face_recognition.face_encodings(rgb_frame, face_locations)
                     for face_encoding in face_encodings:
                         matches = face_recognition.compare_faces(known_face_encodings, face_encoding)
                         if True in matches:
-                            first_match_index = matches.index(True)
-                            person_name = known_face_names[first_match_index]
-                            break # Assume one known face for now
+                            person_name = known_face_names[matches.index(True)]
+                            break
                 
-                # Pose Estimation
                 pose_results = pose_estimator.process(rgb_frame)
                 if pose_results.pose_landmarks:
                     person_action = get_person_action(pose_results.pose_landmarks)
                 
-                # Add the detailed person data to the scene
-                main_person_data = {
-                    'label': person_name,
-                    'box': (px1, py1, px2, py2),
-                    'action': person_action
-                }
-                current_confirmed_objects.append(main_person_data)
+                main_person['label'] = person_name
+                main_person['action'] = person_action
+                current_confirmed_objects.append(main_person)
 
-
-            # 3. Finalize positions for all objects to be described
             final_scene_objects = []
             for obj in current_confirmed_objects:
-                x1, y1, x2, y2 = obj['box']
+                x1, _, x2, _ = obj['box']
                 center_x = (x1 + x2) / 2
-                obj['position'] = get_object_position(center_x, frame.shape[1])
+                obj['position'] = get_object_position(center_x, resized_frame.shape[1])
                 final_scene_objects.append(obj)
 
             current_confirmed_set = set(obj['label'] for obj in final_scene_objects)
@@ -273,8 +267,14 @@ def main():
                 last_confirmed_set = current_confirmed_set
                 last_ai_narration_time = time.time()
         
-        if annotated_frame is not None:
-            cv2.imshow("Virtual Eye - Press ESC to quit", annotated_frame)
+        # --- FIX: Display the last annotated frame ---
+        # This makes the visuals consistent with the processed information.
+        display_frame = frame # Default to raw camera feed
+        if last_annotated_frame is not None:
+            # Resize the smaller annotated frame back to the original size for display
+            display_frame = cv2.resize(last_annotated_frame, (frame.shape[1], frame.shape[0]))
+        
+        cv2.imshow("Virtual Eye - Press ESC to quit", display_frame)
 
         if cv2.waitKey(1) & 0xFF == 27:
             break
@@ -288,3 +288,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
